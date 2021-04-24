@@ -27,10 +27,10 @@ function main()
     lz = az*nz
     # cutoff distance for neighbor list
     cutoff = 10.0
-    timeStep = 10.0
+    timeStep = 10.0 / TIME_UNIT
 
     NN = zeros(Int32, N, 1)
-    NL = zeros(Int32, N*maxNeighbors, 1)
+    NL = zeros(Int32, N, maxNeighbors)
     m = zeros(Float16, N, 1)
     x = zeros(Float32, N, 1)
     y = zeros(Float32, N, 1)
@@ -41,20 +41,33 @@ function main()
     fx = zeros(Float32, N, 1)
     fy = zeros(Float32, N, 1)
     fz = zeros(Float32, N, 1)
-    hx = zeros(Float32, Nd, 1)
-    hy = zeros(Float32, Nd, 1)
-    hz = zeros(Float32, Nd, 1)
-
+    hx = zeros(Int(Nd), 1)
+    hy = zeros(Int(Nd), 1)
+    hz = zeros(Int(Nd), 1)
+    hc = zeros(Float32, 3, 1)
     # initialize mass
     for n in 1:N
         m[n] = 40.0
     end
-    # initialize position
+    # Initialize position
     x, y, z = initializePosition(n0, nx, ny, nz, ax, ay, az, x, y, z)
-    # initialize velocity
+    # Initialize velocity
     vx, vy, vz = initializeVelocity(N, T0, m, vx, vy, vz)
-    # initialize neighbor list
-    initializeNeighbor(N, NN, NL, x, y, z, lx, ly, lz, maxNeighbors, cutoff)
+    # Initialize neighbor list
+    NN, NL = initializeNeighbor(N, NN, NL, x, y, z, lx, ly, lz, maxNeighbors, cutoff)
+    # Find force and heat current
+    fx, fy, fz, hc= findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
+
+    println(hc)
+    println(NL[1:5,1:5])
+    # equilibration
+    @time begin
+        for step in 1:Ne
+            #integrate(N, timeStep, m, fx, fy, fz, )
+            findForce()
+        end
+
+
 end
 
 function initializePosition(n0, nx, ny, nz, ax, ay, az, x, y, z)
@@ -153,20 +166,21 @@ function initializeNeighbor(N, NN, NL, x, y, z, lx, ly, lz, maxNeighbors, cutoff
             x12, y12, z12 = applyMic(lx, ly, lz, halflx, halfly, halflz, x12, y12, z12)
             distancesquare = x12^2 + y12^2 + z12^2
             if distancesquare < cutoffsquare
-                NL[n1*maxNeighbors + NN[n1]] = n2
                 NN[n1] += 1
-                NL[n2*maxNeighbors + NN[n2]] = n1
+                NL[n1, NN[n1]] = n2
                 NN[n2] += 1
+                NL[n2, NN[n2]] = n1
             end
             if NN[n1] > maxNeighbors
                 throw(DomainError(cutoff, "cutoff for neighbor list is too large!"))
             end
         end
     end
+    return NN, NL
 end
 
 function applyMic(lx, ly, lz, halflx, halfly, halflz, x12, y12, z12)
-    # ???
+    # Apply periodic boundary condition and minimum image convention 
     if x12  < -halflx
         x12 += lx
     elseif x12 > halflx
@@ -185,3 +199,54 @@ function applyMic(lx, ly, lz, halflx, halfly, halflz, x12, y12, z12)
     return x12, y12, z12
 end
 
+function findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
+    epsilon = 1.032e-2
+    sigma = 3.405
+    cutoff = sigma*3.0;
+    cutoffsquare = cutoff*cutoff;
+    sigma3 = sigma*sigma*sigma;
+    sigma6 = sigma3*sigma3;
+    sigma12 = sigma6*sigma6;
+    factor1 = 24.0*epsilon*sigma6;
+    factor2 = 48.0*epsilon*sigma12;
+    
+    halflx = lx*0.5
+    halfly = ly*0.5
+    halflz = lz*0.5
+    for n = 1:N
+        for m = 1:NN[n]
+            nn = NL[n, m]
+            if nn < n
+               continue
+            end
+            xij = x[nn] - x[n]
+            yij = y[nn] - y[n]
+            zij = z[nn] - z[n]
+            xij, yij, zij = applyMic(lx, ly, lz, halflx, halfly, halflz, xij, yij, zij)
+            rsquare = xij*xij + yij*yij + zij*zij
+            if rsquare > cutoffsquare
+                continue
+            end
+            r4 = rsquare*rsquare
+            r8 = r4*r4
+            r14 = rsquare*r4*r8
+            fij = factor1/r8 - factor2/r14
+            fx[n] += fij*xij
+            fx[nn] -= fij*xij
+            fy[n] += fij*yij
+            fy[nn] -= fij*yij
+            fz[n] += fij*zij
+            fz[nn] -= fij*zij
+            # ???
+            fdotv = xij*(vx[n] + vx[nn]) + yij*(vy[n] + vy[nn]) + zij*(vz[n] + vz[nn])
+            fdotv *= fij*0.5
+            hc[1] -= xij*fdotv
+            hc[2] -= yij*fdotv
+            hc[3] -= zij*fdotv
+        end
+    end
+    return fx, fy, fz, hc
+end
+
+
+@time main()
