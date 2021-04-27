@@ -1,5 +1,7 @@
-# 2021/04/23 TODO: fuction initializeNeighbor
-using LinearAlgebra
+# 2021/04/27 fixed: The bug of force field computation
+# The result of heat current is 0.2361 \pm 0.0268 (Run five times in total)
+
+using LinearAlgebra, DelimitedFiles
 const KB = 8.617e-5
 const TIME_UNIT = 1.018e+1
 const KAPPA_UNIT = 1.574e+5
@@ -10,12 +12,12 @@ function main()
     nz = 4
     n0 = 4
     N = n0*nx*ny*nz
-    Ne = 2e+4
-    Np = 2e+4
+    Ne = 20000
+    Np = 20000
     Ns = 10
     # number of heat current list
-    Nd = Np/Ns
-    Nc = Nd/10
+    Nd = Int(Np/Ns)
+    Nc = Int(Nd/10)
     maxNeighbors = 100
     
     T0 = 60.0
@@ -31,7 +33,7 @@ function main()
 
     NN = zeros(Int32, N, 1)
     NL = zeros(Int32, N, maxNeighbors)
-    m = zeros(Float16, N, 1)
+    m = zeros(Float32, N, 1)
     x = zeros(Float32, N, 1)
     y = zeros(Float32, N, 1)
     z = zeros(Float32, N, 1)
@@ -41,9 +43,9 @@ function main()
     fx = zeros(Float32, N, 1)
     fy = zeros(Float32, N, 1)
     fz = zeros(Float32, N, 1)
-    hx = zeros(Int(Nd), 1)
-    hy = zeros(Int(Nd), 1)
-    hz = zeros(Int(Nd), 1)
+    hx = zeros(Float32, Nd, 1)
+    hy = zeros(Float32, Nd, 1)
+    hz = zeros(Float32, Nd, 1)
     hc = zeros(Float32, 3, 1)
     # initialize mass
     for n in 1:N
@@ -56,18 +58,41 @@ function main()
     # Initialize neighbor list
     NN, NL = initializeNeighbor(N, NN, NL, x, y, z, lx, ly, lz, maxNeighbors, cutoff)
     # Find force and heat current
-    fx, fy, fz, hc= findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
-
-    println(hc)
-    println(NL[1:5,1:5])
+    fx, fy, fz, hc = findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
     # equilibration
     @time begin
+    
         for step in 1:Ne
-            #integrate(N, timeStep, m, fx, fy, fz, )
-            findForce()
+            if step % 2000 == 0
+                println("The steps of equilibration is ", step)
+            end
+            vx, vy, vz, x, y, z = integrate(N, timeStep, m, fx, fy, fz, vx, vy, vz, x, y, z, 1)
+            fx, fy, fz, hc= findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
+            vx, vy, vz, x, y, z = integrate(N, timeStep, m, fx, fy, fz, vx, vy, vz, x, y, z, 2)
+            vx, vy, vz = scaleVelocity(N, T0, m, vx, vy, vz)
+        
         end
+    end
 
+    @time begin
+        count::Int32 = 1
+        for step in 1:Np
+            if step % 2000 == 0
+                println("The steps of production is ", step)
+            end
+            vx, vy, vz, x, y, z = integrate(N, timeStep, m, fx, fy, fz, vx, vy, vz, x, y, z, 1)
+            fx, fy, fz, hc= findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
+            vx, vy, vz, x, y, z = integrate(N, timeStep, m, fx, fy, fz, vx, vy, vz, x, y, z, 2)
+            if step % Ns == 0
+                hx[count] = hc[1]
+                hy[count] = hc[2]
+                hz[count] = hc[3]
+                count += 1
+            end
+        end
+    end
 
+    findHacKappa(Nd, Nc, timeStep*Ns, T0, lx*ly*lz, hx, hy, hz)
 end
 
 function initializePosition(n0, nx, ny, nz, ax, ay, az, x, y, z)
@@ -112,6 +137,22 @@ function initializeVelocity(N, T0, m, vx, vy, vz)
         vz[n] -= averageMomentum[3]/m[n]
     end
     # scale velocity
+    for n = 1:N
+        vsquare = vx[n]*vx[n] + vy[n]*vy[n] + vz[n]*vz[n]
+        temperature += m[n]*vsquare
+    end
+    temperature /= 3.0*KB*N
+    scaleFactor = sqrt(T0/temperature)
+    for n = 1:N
+        vx[n] *= scaleFactor
+        vy[n] *= scaleFactor
+        vz[n] *= scaleFactor
+    end
+    return vx, vy, vz
+end
+
+function scaleVelocity(N, T0, m, vx, vy, vz)
+    temperature = 0.0
     for n = 1:N
         vsquare = vx[n]*vx[n] + vy[n]*vy[n] + vz[n]*vz[n]
         temperature += m[n]*vsquare
@@ -203,13 +244,20 @@ function findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
     epsilon = 1.032e-2
     sigma = 3.405
     cutoff = sigma*3.0;
-    cutoffsquare = cutoff*cutoff;
-    sigma3 = sigma*sigma*sigma;
-    sigma6 = sigma3*sigma3;
-    sigma12 = sigma6*sigma6;
-    factor1 = 24.0*epsilon*sigma6;
-    factor2 = 48.0*epsilon*sigma12;
-    
+    cutoffsquare = cutoff*cutoff
+    sigma3 = sigma*sigma*sigma
+    sigma6 = sigma3*sigma3
+    sigma12 = sigma6*sigma6
+    factor1 = 24.0*epsilon*sigma6
+    factor2 = 48.0*epsilon*sigma12
+    for i in 1:3
+        hc[i] = 0
+    end
+    for j in 1:N
+        fx[j] = 0
+        fy[j] = 0
+        fz[j] = 0
+    end
     halflx = lx*0.5
     halfly = ly*0.5
     halflz = lz*0.5
@@ -225,7 +273,7 @@ function findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
             xij, yij, zij = applyMic(lx, ly, lz, halflx, halfly, halflz, xij, yij, zij)
             rsquare = xij*xij + yij*yij + zij*zij
             if rsquare > cutoffsquare
-                continue
+               continue
             end
             r4 = rsquare*rsquare
             r8 = r4*r4
@@ -246,6 +294,69 @@ function findForce(N, NN, NL, lx, ly, lz, x, y, z, fx, fy, fz, vx, vy, vz, hc)
         end
     end
     return fx, fy, fz, hc
+end
+
+function integrate(N, timeStep, m, fx, fy, fz, vx, vy, vz, x, y, z, switch)
+    timeStepHalf = timeStep*0.5
+    for n = 1:N
+        massInv = 1.0/m[n]
+        ax = fx[n]*massInv
+        ay = fy[n]*massInv
+        az = fz[n]*massInv
+        vx[n] += ax*timeStepHalf
+        vy[n] += ay*timeStepHalf
+        vz[n] += az*timeStepHalf
+        if switch == 1
+            x[n] += vx[n]*timeStep
+            y[n] += vy[n]*timeStep
+            z[n] += vz[n]*timeStep
+        elseif switch == 2
+            continue
+        end
+    end
+    return vx, vy, vz, x, y, z
+end
+
+function findHacKappa(Nd, Nc, dt, T0, V, hx, hy, hz)
+    dtinPs = dt*TIME_UNIT/1000.0
+    M = Nd - Nc
+    hacx = zeros(Float32, Nc, 1)
+    hacy = zeros(Float32, Nc, 1)
+    hacz = zeros(Float32, Nc, 1)
+    rtcx = zeros(Float32, Nc, 1)
+    rtcy = zeros(Float32, Nc, 1)
+    rtcz = zeros(Float32, Nc, 1)
+    hacx, hacy, hacz = findHac(Nc, M, hx, hy, hz, hacx, hacy, hacz)
+    factor = dt*0.5*KAPPA_UNIT / (KB*T0*T0*V)
+    rtcx, rtcy, rtcz = findRtc(Nc, factor, hacx, hacy, hacz, rtcx, rtcy, rtcz)
+    datafile = open("kappa.dat", "a+")
+    for nc = 1:Nc
+        writedlm(datafile, [nc*dtinPs hacx[nc] hacy[nc] hacz[nc] rtcx[nc] rtcy[nc] rtcz[nc]])
+    end
+    close(datafile)
+end
+
+function findHac(Nc, M, hx, hy, hz, hacx, hacy, hacz)
+    for nc = 1:Nc
+        for m = 1:M
+            hacx[nc] += hx[m]*hx[m + nc]
+            hacy[nc] += hy[m]*hy[m + nc]
+            hacz[nc] += hz[m]*hz[m + nc]
+        end
+        hacx[nc] /= M
+        hacy[nc] /= M
+        hacz[nc] /= M
+    end
+    return hacx, hacy, hacz
+end
+
+function findRtc(Nc, factor, hacx, hacy, hacz, rtcx, rtcy, rtcz)
+    for nc = 2:Nc
+        rtcx[nc] = rtcx[nc - 1] + (hacx[nc - 1] + hacx[nc])*factor
+        rtcy[nc] = rtcy[nc - 1] + (hacy[nc - 1] + hacy[nc])*factor
+        rtcz[nc] = rtcz[nc - 1] + (hacz[nc - 1] + hacz[nc])*factor
+    end
+    return rtcx, rtcy, rtcz
 end
 
 
